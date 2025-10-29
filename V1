@@ -1,0 +1,177 @@
+// Unified Mean Reversion Oscillator [QuantJazz] v2.4
+// Combines Smooth Price Oscillator, Two-Pole Oscillator, and Inverse Fisher Transform of Williams %R
+
+//@version=6
+strategy("Unified Mean Reversion Oscillator [QuantJazz] v2.4", overlay=false, default_qty_type=strategy.percent_of_equity, default_qty_value=100)
+
+// ══════════════════════════════════════════════
+// ⛭ INPUTS
+// ══════════════════════════════════════════════
+lenSmooth = input.int(20, "Smoothing Length")
+thresh    = input.float(1.0, "Threshold", step=0.1)
+lenStd    = input.int(50, "Standard Deviation Length")
+lenWPR    = input.int(14, "Williams %R Length")
+wmaLen    = input.int(9,  "Inverse Fisher Smoothing")
+lookback  = input.int(5,  "Signal Lookback Window")
+showBg    = input.bool(true, "Show Background Highlight")
+useBackgroundForSignals = input.bool(false, "Trade Using Buy/Sell Backgrounds")
+
+fromDate  = input.time(timestamp("2024-01-01 00:00 +0000"), title="Start Date")
+toDate    = input.time(timestamp("2025-12-31 23:59 +0000"), title="End Date")
+
+useDateRange = input.bool(false, "Use Date Range")
+useHourFilter = input.bool(false, "Use Hour Filter")
+useDayFilter = input.bool(false, "Use Day Filter")
+useVolumeFilter = input.bool(false, "Use Volume Filter")
+usePriceFilter = input.bool(false, "Use Price Filter")
+useFloatFilter = input.bool(false, "Use Float Filter")
+usePriceGainFilter = input.bool(false, "Use Price Gain Filter")
+
+startHour = input.int(7, "Start Hour (Central Time)", minval=0, maxval=23)
+endHour   = input.int(16, "End Hour (Central Time)", minval=0, maxval=23)
+dayFilterCsv = input.string("Mon,Tue,Wed,Thu,Fri,Sun", "Allowed Days (CSV)")
+
+rvCandles     = input.int(20, "Relative Volume Lookback (Candles)")
+rvFactor      = input.float(3.0, "Relative Volume Multiplier")
+
+minPrice    = input.float(0.04, "Minimum Price")
+maxPrice    = input.float(40.0, "Maximum Price")
+minFloat    = input.float(1e6, "Min Float", step=1e6)
+maxFloat    = input.float(1e8, "Max Float", step=1e6)
+
+priceChangeCandles = input.int(288, "Price Change Lookback (Candles)")
+minPriceChangePct = input.float(5.0, "Minimum Price % Gain")
+
+exitProfitPct = input.float(1.0, "Exit Only If Profit ≥ (%)")
+maxHoldHrs    = input.int(128, "Max Hold Time (Hours)")
+
+// ══════════════════════════════════════════════
+// ⛓ SMOOTH OSCILLATOR LOGIC
+// ══════════════════════════════════════════════
+method smoother(float price, int period) =>
+    step = 2.0 * math.pi / period
+    a1 = math.exp(-math.sqrt(2) * math.pi / period)
+    b1 = 2 * a1 * math.cos(math.sqrt(2) * step / period)
+    c2 = b1
+    c3 = -a1 * a1
+    c1 = 1 - c2 - c3
+    smoothed = 0.0
+    smoothed := bar_index >= 4 ? c1 * (price + price[1]) / 2 + c2 * smoothed[1] + c3 * smoothed[2] : price
+    smoothed
+
+fast = close.smoother(lenSmooth)
+slow = close.smoother(lenSmooth * 2)
+osc = ta.hma(fast - slow, 30)
+std = ta.stdev(osc, lenStd)
+norm = osc / std
+normFiltered = ta.ema(norm, 8)
+
+// ══════════════════════════════════════════════
+// 🎣 TWO-POLE OSCILLATOR
+// ══════════════════════════════════════════════
+sma1 = ta.sma(close, 25)
+smaDiff = ((close - sma1) - ta.sma(close - sma1, 25)) / ta.stdev(close - sma1, 25)
+
+f_two_pole(source, length) =>
+    var float smooth1 = na
+    var float smooth2 = na
+    alpha = 2.0 / (length + 1)
+    smooth1 := na(smooth1) ? source : (1 - alpha) * smooth1 + alpha * source
+    smooth2 := na(smooth2) ? smooth1 : (1 - alpha) * smooth2 + alpha * smooth1
+    smooth2
+
+twoPole = f_two_pole(smaDiff, lenSmooth)
+twoPolePrev = twoPole[4]
+
+// ══════════════════════════════════════════════
+// ⓦ INVERSE FISHER WILLIAMS %R
+// ══════════════════════════════════════════════
+wpr = ta.wpr(lenWPR)
+wprs = 0.1 * (wpr + 50)
+wprSmoothed = ta.wma(wprs, wmaLen)
+fisher = (math.exp(2 * wprSmoothed) - 1) / (math.exp(2 * wprSmoothed) + 1)
+
+// ══════════════════════════════════════════════
+// 🎯 UNIFIED OSCILLATOR
+// ══════════════════════════════════════════════
+combo = (normFiltered + twoPole + fisher) / 3
+
+// ══════════════════════════════════════════════
+// ⚡ ENTRY / EXIT TRIGGERS
+// ══════════════════════════════════════════════
+isRisingCombo  = ta.rising(combo, 1)
+isFallingCombo = ta.falling(combo, 1)
+
+buyTrigger  = combo < -thresh and isRisingCombo
+sellTrigger = combo >  thresh and isFallingCombo
+
+recentBuy  = ta.barssince(buyTrigger)  < lookback
+recentSell = ta.barssince(sellTrigger) < lookback
+
+inDateRange = not useDateRange or (time >= fromDate and time <= toDate)
+
+vHour = hour(time, "America/Chicago")
+getDayName(int day) =>
+      day == dayofweek.sunday    ? "Sun" :
+      day == dayofweek.monday    ? "Mon" :
+      day == dayofweek.tuesday   ? "Tue" :
+      day == dayofweek.wednesday ? "Wed" :
+      day == dayofweek.thursday  ? "Thu" :
+      day == dayofweek.friday    ? "Fri" :
+      day == dayofweek.saturday  ? "Sat" : ""
+
+dayName = getDayName(dayofweek(time))
+allowedDay = not useDayFilter or str.contains(dayFilterCsv, dayName)
+inHourRange = not useHourFilter or (vHour >= startHour and vHour <= endHour)
+
+volNow = math.sum(volume, rvCandles)
+avgVol = math.sum(volume, 1)
+isHighVolume = not useVolumeFilter or volNow >= rvFactor * avgVol
+
+priceOk = not usePriceFilter or (close >= minPrice and close <= maxPrice)
+floatOk = not useFloatFilter or true
+
+priceDelta = 100 * (close - close[priceChangeCandles]) / close[priceChangeCandles]
+isPriceUp = not usePriceGainFilter or priceDelta >= minPriceChangePct
+
+marketUp = true
+
+allowLong = inDateRange and inHourRange and allowedDay and isHighVolume and priceOk and floatOk and isPriceUp and marketUp
+
+// ══════════════════════════════════════════════
+// 💹 STRATEGY EXECUTION (LONG ONLY)
+// ══════════════════════════════════════════════
+entryTime = 0
+entryTime := strategy.opentrades > 0 and strategy.opentrades.entry_bar_index(0) == bar_index ? time : entryTime[1]
+hoursHeld = (time - entryTime) / (1000 * 60 * 60)
+isProfitable = strategy.opentrades.profit(0) / strategy.opentrades.entry_price(0) >= exitProfitPct / 100
+maxHoldExceeded = hoursHeld >= maxHoldHrs
+
+enterOnBg = useBackgroundForSignals and showBg and recentBuy
+exitOnBg  = useBackgroundForSignals and showBg and recentSell
+
+shouldEnter = (enterOnBg or (recentBuy and not useBackgroundForSignals)) and strategy.position_size == 0 and allowLong
+shouldExit  = (exitOnBg  or (recentSell and not useBackgroundForSignals)) and strategy.position_size > 0 and isProfitable
+
+if shouldEnter
+    strategy.entry("Long", strategy.long)
+
+if shouldExit or (strategy.position_size > 0 and maxHoldExceeded)
+    strategy.close("Long")
+
+// ══════════════════════════════════════════════
+// 📈 VISUALIZATION
+// ══════════════════════════════════════════════
+p0 = plot(0, color=color.gray, linewidth=1)
+pUpper = plot(thresh, color=color.gray)
+pLower = plot(-thresh, color=color.gray)
+pCombo = plot(combo, color=color.white, linewidth=2)
+
+cloudGreen = color.new(color.teal, 85)
+cloudRed   = color.new(color.orange, 85)
+
+fill(p0, pCombo, combo > 0 ? cloudGreen : na, title="Bull Cloud")
+fill(p0, pCombo, combo < 0 ? cloudRed   : na, title="Bear Cloud")
+
+bgcolor(showBg and recentBuy  ? color.new(color.green, 36) : na, title="Buy Background")
+bgcolor(showBg and recentSell ? color.new(color.red, 88)   : na, title="Sell Background")
